@@ -122,6 +122,7 @@ if [ -d "./package/network/utils/nftables" ]; then
     nft_dir="./package/network/utils/nftables/patches"
     mkdir -p "$nft_dir"
     cp -f "$SRC/patches/nftables/002-nftables-add-fullcone-expression-support.patch" "$nft_dir/"
+    cp -f "$SRC/patches/nftables/003-nftables-handle-fullcone-in-json-parser-and-optimizer.patch" "$nft_dir/"
     echo "[nftables] applied"
     applied=$((applied + 1))
 else
