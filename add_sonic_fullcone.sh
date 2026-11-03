@@ -60,7 +60,7 @@ applied=0
 skipped=0
 
 # --- Kernel patches ---
-#   984: nf_nat_core fullcone (SONiC core, 3-tuple hash)
+#   984: nf_nat_core fullcone (SONiC core, 3-tuple hash, with the fixes submitted to SONiC)
 #   985: xt_MASQUERADE FULLCONE target (iptables, PRE+POST hooks)
 #   986: nft_masq fullcone expression (nftables, PRE+POST hooks)
 for kv in $kernel_versions; do
