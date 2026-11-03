@@ -21,9 +21,12 @@ register tracking infrastructure. Upstream commit 6b94d081f81d
 dropped nft_expr_ops->reduce and NFT_REDUCE_READONLY, and it has been
 backported into the 6.6.y, 6.12.y and 6.18.y stable trees, so a
 LINUX_VERSION_CODE test would not work: key off the macro instead.
+
+The expression type is registered for NFPROTO_UNSPEC, so it can be used
+in ip, ip6 and inet tables; its init rejects other table families.
 ---
- net/netfilter/nft_masq.c | 122 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 122 insertions(+)
+ net/netfilter/nft_masq.c | 136 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 136 insertions(+)
 
 --- a/net/netfilter/nft_masq.c
 +++ b/net/netfilter/nft_masq.c
@@ -36,7 +39,7 @@ LINUX_VERSION_CODE test would not work: key off the macro instead.
 
  struct nft_masq {
  	u32			flags;
-@@ -128,6 +130,94 @@ static void nft_masq_eval(const struct n
+@@ -128,6 +130,108 @@ static void nft_masq_eval(const struct n
  	}
  }
 
@@ -59,6 +62,20 @@ LINUX_VERSION_CODE test would not work: key off the macro instead.
 +	[NFTA_FULLCONE_REG_PROTO_MIN]	= { .type = NLA_U32 },
 +	[NFTA_FULLCONE_REG_PROTO_MAX]	= { .type = NLA_U32 },
 +};
++
++/* One expression type serves ip, ip6 and inet NAT tables */
++static int nft_fullcone_init(const struct nft_ctx *ctx,
++			     const struct nft_expr *expr,
++			     const struct nlattr * const tb[])
++{
++	switch (ctx->family) {
++	case NFPROTO_IPV4:
++	case NFPROTO_IPV6:
++	case NFPROTO_INET:
++		return nft_masq_init(ctx, expr, tb);
++	}
++	return -EOPNOTSUPP;
++}
 +
 +static int nft_fullcone_validate(const struct nft_ctx *ctx,
 +				 const struct nft_expr *expr)
@@ -131,7 +148,7 @@ LINUX_VERSION_CODE test would not work: key off the macro instead.
  static void
  nft_masq_ipv4_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
  {
-@@ -228,6 +318,29 @@ static inline void nft_masq_module_exit_
+@@ -228,6 +332,29 @@ static inline void nft_masq_module_exit_
  static inline void nft_masq_module_exit_inet(void) {}
  #endif
 
@@ -140,7 +157,7 @@ LINUX_VERSION_CODE test would not work: key off the macro instead.
 +	.type		= &nft_fullcone_type,
 +	.size		= NFT_EXPR_SIZE(sizeof(struct nft_masq)),
 +	.eval		= nft_fullcone_eval,
-+	.init		= nft_masq_init,
++	.init		= nft_fullcone_init,
 +	.destroy	= nft_fullcone_destroy,
 +	.dump		= nft_masq_dump,
 +	.validate	= nft_fullcone_validate,
@@ -150,7 +167,7 @@ LINUX_VERSION_CODE test would not work: key off the macro instead.
 +};
 +
 +static struct nft_expr_type nft_fullcone_type __read_mostly = {
-+	.family		= NFPROTO_INET,
++	.family		= NFPROTO_UNSPEC,
 +	.name		= "fullcone",
 +	.ops		= &nft_fullcone_ops,
 +	.policy		= nft_fullcone_policy,
@@ -161,7 +178,7 @@ LINUX_VERSION_CODE test would not work: key off the macro instead.
  static int __init nft_masq_module_init(void)
  {
  	int ret;
-@@ -249,6 +362,13 @@ static int __init nft_masq_module_init(v
+@@ -249,6 +376,13 @@ static int __init nft_masq_module_init(v
  		return ret;
  	}
 
@@ -175,7 +192,7 @@ LINUX_VERSION_CODE test would not work: key off the macro instead.
  	return ret;
  }
 
-@@ -257,11 +377,13 @@ static void __exit nft_masq_module_exit(
+@@ -257,11 +391,13 @@ static void __exit nft_masq_module_exit(
  	nft_masq_module_exit_ipv6();
  	nft_masq_module_exit_inet();
  	nft_unregister_expr(&nft_masq_ipv4_type);
