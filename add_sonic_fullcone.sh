@@ -63,17 +63,19 @@ skipped=0
 #   984: nf_nat_core fullcone (SONiC core, 3-tuple hash, with the fixes submitted to SONiC)
 #   985: xt_MASQUERADE FULLCONE target (iptables, PRE+POST hooks)
 #   986: nft_masq fullcone expression (nftables, PRE+POST hooks)
+#   987: fixes on top of 984 that are not part of the SONiC patch
 for kv in $kernel_versions; do
     hack_dir="./target/linux/generic/hack-$kv"
     if [ -d "$hack_dir" ]; then
         cp -f "$SRC/kernel/984-add-sonic-fullcone-support.patch"  "$hack_dir/"
         cp -f "$SRC/kernel/985-add-sonic-fullcone-to-ipt.patch"   "$hack_dir/"
         cp -f "$SRC/kernel/986-add-sonic-fullcone-to-nft.patch"   "$hack_dir/"
-        echo "[kernel]   hack-$kv: applied (984+985+986)"
-        applied=$((applied + 3))
+        cp -f "$SRC/kernel/987-sonic-fullcone-fix-races-and-drops.patch" "$hack_dir/"
+        echo "[kernel]   hack-$kv: applied (984+985+986+987)"
+        applied=$((applied + 4))
     else
         echo "[kernel]   hack-$kv: directory not found, skipped"
-        skipped=$((skipped + 3))
+        skipped=$((skipped + 4))
     fi
 done
 
