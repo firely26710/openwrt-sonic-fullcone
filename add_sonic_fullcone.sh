@@ -163,7 +163,16 @@ if [ -d "./feeds/luci/applications/luci-app-firewall" ]; then
 
     # Append zh_Hans translations directly to po file (po/ is not in build_dir, patches won't work)
     zh_po="./feeds/luci/applications/luci-app-firewall/po/zh_Hans/firewall.po"
-    if [ -f "$zh_po" ] && ! grep -q "Fullcone NAT" "$zh_po"; then
+    if [ -f "$zh_po" ]; then
+        # Replace a block an earlier run appended, its strings may be stale:
+        # the current block is marked, older ones run from the "Fullcone NAT"
+        # msgid to the "所有协议" msgstr.
+        sed '/^# BEGIN openwrt-sonic-fullcone$/,/^# END openwrt-sonic-fullcone$/d' \
+            "$zh_po" > "$zh_po.tmp" && mv "$zh_po.tmp" "$zh_po"
+        if grep -q '^msgid "Fullcone NAT"$' "$zh_po" && grep -q '^msgstr "所有协议"$' "$zh_po"; then
+            sed '/^msgid "Fullcone NAT"$/,/^msgstr "所有协议"$/d' \
+                "$zh_po" > "$zh_po.tmp" && mv "$zh_po.tmp" "$zh_po"
+        fi
         cat "$SRC/translations/zh_Hans.po" >> "$zh_po"
         echo "[luci]     zh_Hans translation appended"
     fi

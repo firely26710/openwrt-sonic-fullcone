@@ -11,23 +11,24 @@ Add fullcone NAT configuration to the firewall web interface:
 defaults.fullcone is a global gate: when off, all zone-level fullcone
 settings are ignored. When on, each zone must explicitly enable fullcone.
 ---
+ htdocs/luci-static/resources/view/firewall/zones.js | 30 ++++++++++++++
+ 1 file changed, 30 insertions(+)
+
 --- a/htdocs/luci-static/resources/view/firewall/zones.js
 +++ b/htdocs/luci-static/resources/view/firewall/zones.js
-@@ -57,4 +57,10 @@
+@@ -57,2 +57,8 @@ return view.extend({
  		o = s.option(form.Flag, 'drop_invalid', _('Drop invalid packets'));
-
++
 +		o = s.option(form.Flag, 'fullcone', _('Fullcone NAT'),
 +			_('Global gate for SONiC-style fullcone NAT. When enabled, each zone can individually activate fullcone in its settings.'));
 +		o.default = '0';
 +		o.rmempty = true;
 +		o.optional = true;
-+
- 		let p = [
- 			s.option(form.ListValue, 'input', _('Input')),
-@@ -178,6 +184,12 @@
+ 
+@@ -179,6 +185,12 @@ return view.extend({
  			return null;
  		};
-
+ 
 +		o = s.taboption('general', form.Flag, 'fullcone', _('Fullcone NAT'),
 +			_('Enable fullcone NAT for this zone. Requires the global Fullcone NAT gate to be enabled in General Settings. ' +
 +			  'Use "Fullcone protocols" in Advanced Settings to restrict scope.'));
@@ -36,15 +37,16 @@ settings are ignored. When on, each zone must explicitly enable fullcone.
 +
  		o = s.taboption('general', form.Flag, 'mtu_fix', _('MSS clamping'));
  		o.modalonly = true;
-
-@@ -279,4 +291,22 @@
+ 
+@@ -281,6 +293,24 @@ return view.extend({
+ 		o.placeholder = '0.0.0.0/0';
  		o.modalonly = true;
-
-+
+ 
 +		o = s.taboption('advanced', form.MultiValue, 'fullcone_proto',
 +			_('Fullcone protocols'),
-+			_('Restrict fullcone NAT to specific L4 protocols. ' +
-+			  'When empty, all protocols use fullcone. ' +
++			_('Restrict fullcone NAT to these protocols; when empty, all of them use fullcone. ' +
++			  'Other protocols always use ordinary masquerading. ' +
++			  'UDP-Lite, SCTP and DCCP also need kernel connection tracking support, which OpenWrt does not enable by default. ' +
 +			  'Recommended: select only UDP for gaming/P2P use cases.'));
 +		o.value('tcp', _('TCP'));
 +		o.value('udp', _('UDP'));
@@ -54,8 +56,10 @@ settings are ignored. When on, each zone must explicitly enable fullcone.
 +		o.depends('fullcone', '1');
 +		o.modalonly = true;
 +		o.optional = true;
-+		o.placeholder = _('All protocols');
++		o.placeholder = _('All of the above');
 +		o.display_size = 5;
 +		o.delimiter = ' ';
 +
- 		o = s.taboption('conntrack', form.Flag, 'masq_allow_invalid', _('Allow "invalid" traffic'),
+ 		o = s.taboption('conntrack', form.Flag, 'masq_allow_invalid', _('Allow "invalid" traffic'), _('Do not install extra rules to reject forwarded traffic with conntrack state <em>invalid</em>. This may be required for complex asymmetric route setups.'));
+ 		o.modalonly = true;
+ 
