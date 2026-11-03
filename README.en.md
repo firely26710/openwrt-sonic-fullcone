@@ -12,10 +12,22 @@ A port of the [SONiC fullcone NAT kernel patch](https://github.com/sonic-net/son
 
 The kernel patch adds a second hash table inside conntrack (`nat_by_manip_src`), keyed by the **post-translation 3-tuple** (protocol, source IP, source port):
 
-- **SNAT direction**: 3-tuple uniqueness guarantees that the same (proto, src_ip, src_port) is never reused by a different connection — this gives Endpoint-Independent Mapping (EIM). **The guarantee only holds when the SNAT rule carries a port range**; the rules fw4 generates do, see [Why SNAT rules carry a port range](#why-snat-rules-carry-a-port-range).
-- **DNAT direction**: reverse lookup — inbound packets find the original internal host through the hash table, providing Endpoint-Independent Filtering (EIF).
-- **Full L4 protocol coverage**: TCP, UDP, ICMP, GRE, SCTP, DCCP, UDPlite.
-- **Zero overhead for non-fullcone traffic**: the fullcone flag is per-rule, not global.
+- **SNAT direction**: 3-tuple uniqueness — a (proto, src_ip, src_port) belongs to one internal endpoint, and every connection of that endpoint reuses it. This gives Endpoint-Independent Mapping (EIM). The SONiC patch checks the 3-tuple only when the rule carries a port range; the rules fw4 and fw3 generate do (except fw3's UDP-Lite rule), see [The port range on SNAT rules](#the-port-range-on-snat-rules).
+- **DNAT direction**: reverse lookup — inbound packets find the original internal host through the hash table, providing Endpoint-Independent Filtering (EIF). As in SONiC, the kernel does not tell mappings of fullcone rules from those of ordinary masquerading; fw4 and fw3 only do the reverse lookup for the protocols they put under fullcone.
+- **Protocols**: fw4 and fw3 use fullcone for TCP and UDP, plus UDP-Lite, SCTP and DCCP when the kernel tracks them (OpenWrt does not enable that by default; kernel 6.18 dropped DCCP), and ordinary masquerading for the rest. Fullcone makes no sense for protocols without ports, such as ICMP and GRE.
+- **Only fullcone rules are affected**: the fullcone flag is per-rule, not global. Mappings of ordinary NAT are recorded in the hash table as well.
+
+### Patch layout
+
+The kernel part keeps the SONiC patch as it is; this project's own changes are in separate patches, not mixed into SONiC's code:
+
+| Patch | Contents |
+|---|---|
+| 984 | The SONiC patch (forward-ported to 6.6+), with the two fixes submitted to SONiC upstream: the direction of replies to connections opened from outside ([sonic-net/sonic-linux-kernel#649](https://github.com/sonic-net/sonic-linux-kernel/pull/649)), and locks for `nat_by_manip_src` ([sonic-net/sonic-linux-kernel#653](https://github.com/sonic-net/sonic-linux-kernel/pull/653)) |
+| 985, 986 | This project's iptables `FULLCONE` target and nftables `fullcone` expression, built into `xt_MASQUERADE.ko` and `nft_masq.ko`. The `fullcone` expression works in ip, ip6 and inet tables |
+| 987 | This project's fixes on top of SONiC, not submitted there: mapping races on several CPUs, the 3-tuple check for rules without a port range, and packets of ordinary NAT being dropped (ESP through `masquerade fully-random`, for example). Without this file, the kernel part is SONiC plus the upstream fixes |
+
+The userspace nftables patch follows the same rule: 002 is kept as it is, and the fixes for crashes in JSON input and `nft -o` are in 003.
 
 ### Supported kernel versions
 
@@ -62,6 +74,7 @@ Remove the patch files and rebuild:
 rm -f target/linux/generic/hack-*/984-add-sonic-fullcone-*.patch
 rm -f target/linux/generic/hack-*/985-add-sonic-fullcone-*.patch
 rm -f target/linux/generic/hack-*/986-add-sonic-fullcone-*.patch
+rm -f target/linux/generic/hack-*/987-sonic-fullcone-*.patch
 rm -f package/network/utils/iptables/patches/901-sonic-fullcone.patch
 rm -f package/network/config/firewall*/patches/001-sonic-fullcone.patch
 rm -f feeds/luci/applications/luci-app-firewall/patches/001-add-fullcone-options.patch
@@ -85,7 +98,7 @@ Note: the `libnftnl` and `nftables` patches (which add the `fullcone` keyword) c
 - **Off** (default): all fullcone functionality is disabled, settings inside zones have no effect.
 - **On**: the feature is available, but each zone still has to **opt in** with its own fullcone checkbox.
 
-This mirrors how OpenWrt's `flow_offloading` works.
+This mirrors how OpenWrt's `flow_offloading` works. On start, fw4 and fw3 both check that the kernel supports fullcone (fw3 looks for `FULLCONE` in `/proc/net/ip_tables_targets`); if it does not, they warn, turn fullcone off and only masquerade.
 
 ### Web UI (LuCI)
 
@@ -140,13 +153,15 @@ Generated nftables rules:
 
 ```nft
 chain srcnat_wan {
-    meta nfproto ipv4 meta l4proto { tcp, udp, sctp, dccp, udplite, icmp, gre } fullcone to :1024-65535
-    meta nfproto ipv4 fullcone                   # other protocols
+    meta nfproto ipv4 meta l4proto { tcp, udp, udplite, sctp, dccp } fullcone to :1024-65535
+    meta nfproto ipv4 masquerade                 # other protocols
 }
 chain dstnat_wan {
-    meta nfproto ipv4 fullcone
+    meta nfproto ipv4 meta l4proto { tcp, udp, udplite, sctp, dccp } fullcone
 }
 ```
+
+On the device, `nft list ruleset` shows UDP-Lite, SCTP and DCCP as protocol numbers, for example `meta l4proto { tcp, udp, 33, 132, 136 }`: OpenWrt's musl does not know these protocol names, and the rules are the same. With fw3, `iptables -t nat -S` likewise shows DCCP as 33.
 
 **UDP only**:
 
@@ -170,6 +185,10 @@ chain dstnat_wan {
 }
 ```
 
+When the zone sets `masq_src` / `masq_dest`, the fullcone rule takes the same address restrictions and is followed by a masquerade rule with the same restrictions for the other protocols. Traffic outside the restrictions gets neither fullcone nor masquerading, as without fullcone.
+
+`fullcone_proto` accepts `tcp`, `udp`, `udplite`, `sctp` and `dccp` (and `tcpudp`). Other values are ignored with a warning (`fw4 check` shows it for fw4; fw3 prints it on start); if none of the listed protocols applies, the zone gets no fullcone.
+
 ### Advanced: hand-written nftables rules
 
 For more complex match conditions, drop a file into `/etc/nftables.d/`:
@@ -190,26 +209,15 @@ table inet fullcone-custom {
 
 Notes:
 - When using custom rules, disable the fw4 fullcone option for that zone to avoid conflicts.
-- **The SNAT side must carry a port range** (`to :1024-65535`), or 3-tuple uniqueness is not enforced; see the next section. The DNAT side needs none.
+- The `fullcone` expression can be used in `inet`, `ip` and `ip6` tables.
+- **The SNAT side must carry a port range** (`to :1024-65535`); see the next section. The DNAT side needs none.
+- The kernel does not tell mappings of fullcone rules from those of ordinary masquerading, so the fullcone DNAT rule sends inbound packets to any existing mapping on the address. Do not mix the two on one protocol, or mappings of ordinary masquerading are open to unknown senders too.
 
-### Why SNAT rules carry a port range
+### The port range on SNAT rules
 
-The SNAT rules fw4 generates carry `to :1024-65535` for every protocol that has a port (or an ICMP id, or a GRE key). This is not decoration — **without it, 3-tuple uniqueness is not enforced at all**.
+The SNAT rules fw4 and fw3 generate carry the port range 1024-65535 (`to :1024-65535` in nft, `--to-ports 1024-65535` in iptables). Both only accept a port range after a match on a protocol, so the fullcone rule first matches the protocols with ports and leaves the rest to the masquerade rule after it. DNAT carries no range, as in SONiC.
 
-The kernel patch is a faithful port of SONiC's, and its `get_unique_tuple()` checks 3-tuple uniqueness only in the `NF_NAT_RANGE_PROTO_SPECIFIED` branch; when the rule has no port range, a translated port is accepted on an ordinary 5-tuple check. SONiC itself never takes that path: its [natmgr](https://github.com/sonic-net/sonic-swss/blob/master/cfgmgr/natmgr.cpp) only adds `--fullcone` when a port range is configured.
-
-What happens without a port range (two inside hosts, both on local UDP 40000, talking to different destinations):
-
-| | no range | with `to :1024-65535` |
-|---|---|---|
-| host 1 → destination A | external port 40000 | external port 40000 |
-| host 2 → destination B | external port **40000**, shared with host 1 | another port |
-| unknown sender → external port 40000 | delivered to **host 2** | delivered to host 1 |
-| host 1 → destination B | **another port**; the mapping depends on the destination | external port 40000 |
-
-The host that mapped first loses inbound reachability on its own port, and its external port changes with the destination — exactly the two things full cone is meant to prevent.
-
-nft only accepts a port range after a match on a protocol, so SNAT is split into two rules: the protocols with a port, id or key get the range, everything else is as before. DNAT carries no range, as in SONiC.
+The range is not only there to stay off low ports: the SONiC patch checks the 3-tuple only when the rule carries a port range, and without one a translated port only gets the ordinary 5-tuple check. Two inside hosts using the same source port towards different destinations then get the same external port, and unknown senders reach only one of them. SONiC itself never takes that path: its [natmgr](https://github.com/sonic-net/sonic-swss/blob/master/cfgmgr/natmgr.cpp) only adds `--fullcone` when a port range is configured. Patch 987 checks the 3-tuple for rules without a range as well. fw3's UDP-Lite rule has none: iptables takes no `--to-ports` for UDP-Lite rules.
 
 **The range starts at 1024**, so an inside host using a source port below 1024 is mapped above it. That is deliberate: full cone forwards every inbound packet sent to a mapped external port to the inside host, so if a LAN client goes out from source port 500 (IPsec IKE) while the router itself runs IPsec on the WAN, that mapping takes the router's port 500 (reasoned from the mechanism, not tested). Router services above 1024 (WireGuard's 51820, for example) are not protected by the range.
 
@@ -218,9 +226,9 @@ nft only accepts a port range after a match on a protocol, so SNAT is split into
 After flashing the firmware:
 
 ```bash
-# 1. Confirm the nftables fullcone expression is available (fw4)
-echo 'add table ip test; add chain ip test t { fullcone; }' | nft -c -f -
-# No error → kernel support is in place
+# 1. Confirm the kernel supports fullcone
+echo 'add table ip test; add chain ip test t { fullcone; }' | nft -c -f -   # fw4: no error means it does
+grep -x FULLCONE /proc/net/ip_tables_targets                              # fw3: prints FULLCONE if it does
 
 # 2. Check that rules were generated (depends on UCI configuration)
 nft list ruleset | grep fullcone                            # fw4
@@ -249,16 +257,17 @@ Note: connections that already exist keep the NAT behaviour they started with; `
 
 - **fw3 only generates IPv4 NAT rules**: in firewall3's `zones.c`, `print_zone_rule` checks `if (zone->masq && handle->family == FW3_FAMILY_V4)` inside the `FW3_TABLE_NAT` branch, and IPv6 takes a different path. As a result, this project's fw3 patch only emits IPv4 fullcone rules.
 
-  **Adding IPv6 fullcone manually**: kernel-side patches 984/985 and the userspace 901 patch are protocol-family agnostic — the `FULLCONE` target is registered for both IPv4 and IPv6. Add the rules in `/etc/firewall.user` (the port range on the POSTROUTING side is explained in the next item):
+  **Adding IPv6 fullcone manually**: kernel-side patches 984/985 and the userspace 901 patch are protocol-family agnostic — the `FULLCONE` target is registered for both IPv4 and IPv6. Add the rules in `/etc/firewall.user` (what the port range is for is explained in [The port range on SNAT rules](#the-port-range-on-snat-rules)):
 
   ```bash
   ip6tables -t nat -A POSTROUTING -o wan -p tcp -j FULLCONE --to-ports 1024-65535
   ip6tables -t nat -A POSTROUTING -o wan -p udp -j FULLCONE --to-ports 1024-65535
-  ip6tables -t nat -A POSTROUTING -o wan -j FULLCONE
-  ip6tables -t nat -A PREROUTING  -i wan -j FULLCONE
+  ip6tables -t nat -A POSTROUTING -o wan -j MASQUERADE
+  ip6tables -t nat -A PREROUTING  -i wan -p tcp -j FULLCONE
+  ip6tables -t nat -A PREROUTING  -i wan -p udp -j FULLCONE
   ```
 
-- **The FULLCONE rules fw3 generates carry no port range**: `-j FULLCONE` is emitted without `--to-ports`, so the kernel never sees `NF_NAT_RANGE_PROTO_SPECIFIED` and 3-tuple uniqueness is not enforced; the behaviour and the reason are in [Why SNAT rules carry a port range](#why-snat-rules-carry-a-port-range). fw4 is fixed; fw3 is not yet (judged from the code, not tested on fw3).
+- **fw3's UDP-Lite rule carries no port range**: iptables only accepts `--to-ports` on TCP, UDP, SCTP, DCCP and ICMP rules, so the FULLCONE rule for UDP-Lite has no range. Without patch 987, 3-tuple uniqueness is not enforced for UDP-Lite (see [The port range on SNAT rules](#the-port-range-on-snat-rules)). With 987 it is, but a connection from a source port below 1024 keeps that port, or gets another one below 1024 if it is taken.
 
 ### General
 
@@ -271,9 +280,9 @@ Note: connections that already exist keep the NAT behaviour they started with; `
 | | SONiC (this project) | xt_FULLCONENAT | nft-fullcone | bcm-fullconenat |
 |---|---|---|---|---|
 | Mapping storage | Inside conntrack itself | Parallel hash table | Parallel hash table | conntrack expectation table |
-| Read-path locking | RCU (no spinlock) | Global spinlock | Global spinlock | Global expect lock |
+| Read-path locking | RCU (per-hash-bucket spinlock with 987) | Global spinlock | Global spinlock | Global expect lock |
 | Lookup complexity | O(1) hash | O(1) hash | O(1) hash | **O(N) full scan** |
-| Protocol coverage | All L4 | UDP only | UDP only | UDP only |
+| Protocol coverage | TCP, UDP (and UDP-Lite/SCTP/DCCP when tracked) | UDP only | UDP only | UDP only |
 | Cleanup | Automatic (conntrack lifecycle) | Workqueue GC | Workqueue GC | Expectation timeout |
 | Per-rule control | Yes (flag bit) | No | No | No |
 | EIM + EIF | Dual hooks (PRE+POST) automatically | Dual hooks automatically | Dual hooks automatically | Relies on the helper mechanism |
@@ -305,7 +314,7 @@ For detailed technical comparison see the [fullcone implementations table](#comp
 ### Where each one wins
 
 **sonic-fullcone is better at**:
-- Cleaner kernel implementation (RCU, no separate module, every protocol)
+- Cleaner kernel implementation (mappings live in conntrack, per-bucket locking, no separate module, TCP included)
 - Clear code provenance (official SONiC, written by Broadcom engineers)
 - Focused feature set, easier to maintain
 
@@ -320,7 +329,7 @@ For detailed technical comparison see the [fullcone implementations table](#comp
 - **Full acceleration bundle** → turboacc (fullcone is just one of its sub-features)
 - **Can the two coexist?** → Not recommended; the fullcone kernel patches conflict.
 
-For most home router users, turboacc's Chion fullcone (UDP only) is enough — gaming, P2P, and VoIP are all UDP. The full-protocol coverage and RCU read path of sonic-fullcone matter more under high concurrency, which home users rarely notice.
+For most home router users, turboacc's Chion fullcone (UDP only) is enough — gaming, P2P, and VoIP are all UDP. The TCP support and per-bucket locking of sonic-fullcone matter more under high concurrency, which home users rarely notice.
 
 That said, in today's **fw4 (nftables)** environment, the rest of turboacc is no longer irreplaceable:
 
@@ -334,14 +343,16 @@ So for fw4 users, turboacc's unique value is essentially fullcone. Its real valu
 
 ```
 kernel/
-  984-add-sonic-fullcone-support.patch      # nf_nat_core.c: 3-tuple hash table, EIM/EIF
+  984-add-sonic-fullcone-support.patch      # nf_nat_core.c: SONiC patch + fixes submitted upstream (3-tuple hash table, EIM/EIF)
   985-add-sonic-fullcone-to-ipt.patch       # xt_MASQUERADE.c: iptables FULLCONE target (PRE+POST)
-  986-add-sonic-fullcone-to-nft.patch       # nft_masq.c: nftables fullcone expression (PRE+POST)
+  986-add-sonic-fullcone-to-nft.patch       # nft_masq.c: nftables fullcone expression (PRE+POST, ip/ip6/inet tables)
+  987-sonic-fullcone-fix-*.patch            # nf_nat_core.c: this project's fixes (races, no port range, dropped packets)
 
 patches/
   iptables/901-sonic-fullcone.patch         # libxt_NAT.c: register the FULLCONE userspace target
   libnftnl/001-libnftnl-*.patch             # fullcone expression serialization
   nftables/002-nftables-*.patch             # nft CLI "fullcone" keyword
+  nftables/003-nftables-*.patch             # fullcone in JSON input and the nft -o optimizer
   luci-app-firewall/001-add-*.patch         # LuCI Web UI integration
 
 translations/
@@ -357,6 +368,8 @@ firewall/
 - Kernel patch: Akhilesh Samineni (Broadcom), from [sonic-net/sonic-linux-kernel](https://github.com/sonic-net/sonic-linux-kernel)
 - nftables / libnftnl expression interface: Syrone Wong (fullcone-nat-nftables)
 - OpenWrt integration: openwrt-sonic-fullcone contributors
+- The locking, concurrency and fw4 address restriction issues were first found by comparing with the changes in [VIKINGYFY/immortalwrt](https://github.com/VIKINGYFY/immortalwrt) and [Canary233/openwrt-sonic-fullcone](https://github.com/Canary233/openwrt-sonic-fullcone)
+- fw3's `FULLCONE` probe and per-protocol rules with a port range, the `fullcone` expression in ip/ip6 tables, and the `ipt_FULLCONE` module alias follow VIKINGYFY's version
 
 ## License
 

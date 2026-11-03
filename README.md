@@ -12,10 +12,22 @@
 
 内核补丁在 conntrack 内部增加了第二张哈希表（`nat_by_manip_src`），以**转换后的 3-tuple**（协议、源 IP、源端口）为索引：
 
-- **SNAT 方向**：3-tuple 唯一性保证——同一个 (proto, src_ip, src_port) 不会被不同连接复用，实现端点无关映射（EIM）。**这个保证只在 SNAT 规则带端口范围时生效**，fw4 生成的规则会自动带上，见[为什么 SNAT 规则带端口范围](#为什么-snat-规则带端口范围)
-- **DNAT 方向**：反向查找——入站数据包通过哈希表找到原始内部主机，实现端点无关过滤（EIF）
-- **全 L4 协议支持**：TCP、UDP、ICMP、GRE、SCTP、DCCP、UDPlite
-- **非 fullcone 流量零开销**：fullcone 标志位是 per-rule 的，不是全局的
+- **SNAT 方向**：3-tuple 唯一性保证——一个 (proto, src_ip, src_port) 只属于一个内网端点，这个端点的所有连接都复用它，实现端点无关映射（EIM）。SONiC 的补丁只在规则带端口范围时检查 3-tuple，fw4 和 fw3 生成的规则都带（fw3 的 UDP-Lite 规则除外），见[SNAT 规则的端口范围](#snat-规则的端口范围)
+- **DNAT 方向**：反向查找——入站数据包通过哈希表找到原始内部主机，实现端点无关过滤（EIF）。和 SONiC 一样，内核不区分映射是 fullcone 规则还是普通 masquerade 建立的，fw4 和 fw3 只对放进 fullcone 的协议做反向查找
+- **协议**：fw4 和 fw3 对 TCP、UDP，以及内核开启了对应连接跟踪的 UDP-Lite、SCTP、DCCP（OpenWrt 默认没开；6.18 内核已经去掉了 DCCP）使用 fullcone，其余协议走普通 masquerade。ICMP、GRE 这类没有端口的协议做 fullcone 没有意义
+- **只影响 fullcone 规则**：fullcone 标志位是 per-rule 的，不是全局的。普通 NAT 的映射也会登记到这张哈希表里
+
+### 补丁组成
+
+内核部分保持 SONiC 原版，本项目自己的修改放在单独的补丁里，不和 SONiC 的代码混在一起：
+
+| 补丁 | 内容 |
+|---|---|
+| 984 | SONiC 原版补丁（移植到 6.6+），加上已提交给 SONiC 上游的两处修复：外部主动连入时回包的方向（[sonic-net/sonic-linux-kernel#649](https://github.com/sonic-net/sonic-linux-kernel/pull/649)），以及 `nat_by_manip_src` 的锁（[sonic-net/sonic-linux-kernel#653](https://github.com/sonic-net/sonic-linux-kernel/pull/653)） |
+| 985、986 | 本项目的 iptables `FULLCONE` target 和 nftables `fullcone` 表达式，分别编进 `xt_MASQUERADE.ko` 和 `nft_masq.ko`。`fullcone` 表达式可用于 ip、ip6、inet 表 |
+| 987 | 本项目在 SONiC 之上的修复，没有提交给 SONiC：多核并发时的映射竞争、规则不带端口范围时的 3-tuple 检查、普通 NAT 的误丢包（例如 `masquerade fully-random` 下的 ESP）。删掉这个文件，内核部分就是“SONiC + 上游修复” |
+
+用户态的 nftables 补丁也一样：002 保持原样，JSON 输入和 `nft -o` 的崩溃修复放在 003。
 
 ### 支持的内核版本
 
@@ -62,6 +74,7 @@ make -j$(nproc)
 rm -f target/linux/generic/hack-*/984-add-sonic-fullcone-*.patch
 rm -f target/linux/generic/hack-*/985-add-sonic-fullcone-*.patch
 rm -f target/linux/generic/hack-*/986-add-sonic-fullcone-*.patch
+rm -f target/linux/generic/hack-*/987-sonic-fullcone-*.patch
 rm -f package/network/utils/iptables/patches/901-sonic-fullcone.patch
 rm -f package/network/config/firewall*/patches/001-sonic-fullcone.patch
 rm -f feeds/luci/applications/luci-app-firewall/patches/001-add-fullcone-options.patch
@@ -85,7 +98,7 @@ make -j$(nproc)
 - **关闭时**（默认）：所有 fullcone 功能禁用，zone 里的设置无效
 - **开启时**：功能可用，但每个 zone 还需要**单独勾选** fullcone 才会生效
 
-这和 OpenWrt 的 `flow_offloading` 是同样的模式。
+这和 OpenWrt 的 `flow_offloading` 是同样的模式。fw4 和 fw3 启动时都会检查内核是否支持 fullcone（fw3 看的是 `/proc/net/ip_tables_targets` 里有没有 `FULLCONE`），不支持就给出警告、关掉 fullcone，只做普通 masquerade。
 
 ### Web 界面（LuCI）
 
@@ -140,13 +153,15 @@ config zone
 
 ```nft
 chain srcnat_wan {
-    meta nfproto ipv4 meta l4proto { tcp, udp, sctp, dccp, udplite, icmp, gre } fullcone to :1024-65535
-    meta nfproto ipv4 fullcone                   # 其余协议
+    meta nfproto ipv4 meta l4proto { tcp, udp, udplite, sctp, dccp } fullcone to :1024-65535
+    meta nfproto ipv4 masquerade                 # 其余协议
 }
 chain dstnat_wan {
-    meta nfproto ipv4 fullcone
+    meta nfproto ipv4 meta l4proto { tcp, udp, udplite, sctp, dccp } fullcone
 }
 ```
+
+在设备上用 `nft list ruleset` 查看时，UDP-Lite、SCTP、DCCP 会显示成协议号，例如 `meta l4proto { tcp, udp, 33, 132, 136 }`：OpenWrt 的 musl 不认识这几个协议名，规则本身没有区别。fw3 用 `iptables -t nat -S` 查看时，DCCP 同样显示成 33。
 
 **仅 UDP**：
 
@@ -170,6 +185,10 @@ chain dstnat_wan {
 }
 ```
 
+zone 设置了 `masq_src` / `masq_dest` 时，fullcone 规则带上同样的地址限制，后面紧跟一条同样限制的 masquerade 处理其余协议；不在限制范围内的流量既不走 fullcone 也不做伪装，和没开 fullcone 时一样。
+
+`fullcone_proto` 只接受 `tcp`、`udp`、`udplite`、`sctp`、`dccp`（也可以写 `tcpudp`），其他值会被忽略并给出警告（fw4 可以用 `fw4 check` 查看，fw3 在启动时输出）；列出的协议全都不适用时，这个 zone 不启用 fullcone。
+
 ### 高级：手写 nftables 规则
 
 如需更复杂的匹配条件，可使用 `/etc/nftables.d/`：
@@ -190,26 +209,15 @@ table inet fullcone-custom {
 
 注意：
 - 使用自定义规则时，应关闭该 zone 的 fw4 fullcone 选项以避免冲突。
-- **SNAT 一侧务必带端口范围**（`to :1024-65535`），否则 3-tuple 唯一性保证不生效，见下一节。DNAT 一侧不需要。
+- `fullcone` 表达式可以写在 `inet`、`ip`、`ip6` 表里。
+- **SNAT 一侧务必带端口范围**（`to :1024-65535`），原因见下一节。DNAT 一侧不需要。
+- 内核不区分映射是 fullcone 规则还是普通 masquerade 建立的，DNAT 一侧的 fullcone 会把入站包转给这个地址上所有已有的映射。不要在同一个协议上混用两者，否则普通 masquerade 的映射也会向陌生来源开放。
 
-### 为什么 SNAT 规则带端口范围
+### SNAT 规则的端口范围
 
-fw4 给有端口（以及 ICMP id、GRE key）的协议生成的 SNAT 规则都带 `to :1024-65535`。这不是装饰——**不带它，3-tuple 唯一性保证根本不生效**。
+fw4 和 fw3 生成的 SNAT 规则带端口范围 1024-65535（nft 写作 `to :1024-65535`，iptables 写作 `--to-ports 1024-65535`）。两者都只接受跟在协议匹配之后的端口范围，所以 fullcone 规则先匹配有端口的协议，其余协议交给后面那条 masquerade。DNAT 方向不带范围，与 SONiC 一致。
 
-内核补丁是 SONiC 的原样移植，`get_unique_tuple()` 只在 `NF_NAT_RANGE_PROTO_SPECIFIED` 分支里做 3-tuple 检查；规则没有端口范围时，转换后的端口只经过普通的 5-tuple 检查就会被接受。SONiC 自己不会走到那条路径：它的 [natmgr](https://github.com/sonic-net/sonic-swss/blob/master/cfgmgr/natmgr.cpp) 只在配置了端口范围时才加 `--fullcone`。
-
-不带端口范围时的实际表现（两台内网主机都用本地 UDP 40000，分别访问不同的目标）：
-
-| | 不带范围 | 带 `to :1024-65535` |
-|---|---|---|
-| 主机 1 → 目标 A | 外部端口 40000 | 外部端口 40000 |
-| 主机 2 → 目标 B | 外部端口 **40000**，与主机 1 共用 | 另一个端口 |
-| 陌生来源 → 外部端口 40000 | 投给**主机 2** | 投给主机 1 |
-| 主机 1 → 目标 B | **另一个端口**，映射随目标变化 | 外部端口 40000 |
-
-先建立映射的主机丢了这个端口上的入站可达性，换个目标外部端口还会变——正好是全锥要避免的两件事。
-
-nft 只接受跟在协议匹配之后的端口范围，所以 SNAT 拆成两条：有端口/id/key 的协议带范围，其余协议照旧。DNAT 方向不带范围，与 SONiC 一致。
+这个范围不只是为了避开低端口：SONiC 的补丁只在规则带端口范围时检查 3-tuple，不带范围时，转换后的端口只经过普通的 5-tuple 检查。两台内网主机用同一个源端口访问不同的目标时，会拿到同一个外部端口，陌生来源的包只会投给其中一台。SONiC 自己不会走到这条路径：它的 [natmgr](https://github.com/sonic-net/sonic-swss/blob/master/cfgmgr/natmgr.cpp) 只在配置了端口范围时才加 `--fullcone`。987 补丁让不带范围的规则也检查 3-tuple。fw3 的 UDP-Lite 规则就不带范围：iptables 不接受 UDP-Lite 规则的 `--to-ports`。
 
 **范围从 1024 开始**，所以内网主机使用 1024 以下的源端口时会被映射到 1024 以上。这是有意的：全锥会把发往某个已映射外部端口的所有入站转给内网主机，若内网客户端以源端口 500 出站（IPsec IKE），而路由器自己也在 WAN 上跑 IPsec，路由器的 500 端口就会被这条映射占去（按机制推断，未实测）。1024 以上的路由器服务端口（例如 WireGuard 51820）不受这个范围保护。
 
@@ -218,9 +226,9 @@ nft 只接受跟在协议匹配之后的端口范围，所以 SNAT 拆成两条�
 刷机后检查：
 
 ```bash
-# 1. 确认 nftables fullcone 表达式可用（fw4）
-echo 'add table ip test; add chain ip test t { fullcone; }' | nft -c -f -
-# 没报错说明内核支持
+# 1. 确认内核支持 fullcone
+echo 'add table ip test; add chain ip test t { fullcone; }' | nft -c -f -   # fw4：没报错说明支持
+grep -x FULLCONE /proc/net/ip_tables_targets                              # fw3：输出 FULLCONE 说明支持
 
 # 2. 检查规则是否生成（取决于 UCI 配置）
 nft list ruleset | grep fullcone                            # fw4
@@ -249,16 +257,17 @@ grep "dport=端口 " /proc/net/nf_conntrack
 
 - **fw3 代码只对 IPv4 生成 NAT 规则**：firewall3 的 `zones.c` 里 `print_zone_rule` 在 `FW3_TABLE_NAT` 分支中有 `if (zone->masq && handle->family == FW3_FAMILY_V4)` 判断，IPv6 走不同路径。因此本项目的 fw3 patch 只生成 IPv4 fullcone 规则。
 
-  **手动添加 IPv6 fullcone**：内核侧的 984/985 补丁和 901 用户态补丁都是 IPv4/IPv6 通用的，`FULLCONE` target 对两个协议族都注册了。可以在 `/etc/firewall.user` 里手动加（POSTROUTING 一侧的端口范围原因见下一条）：
+  **手动添加 IPv6 fullcone**：内核侧的 984/985 补丁和 901 用户态补丁都是 IPv4/IPv6 通用的，`FULLCONE` target 对两个协议族都注册了。可以在 `/etc/firewall.user` 里手动加（端口范围的作用见[SNAT 规则的端口范围](#snat-规则的端口范围)）：
 
   ```bash
   ip6tables -t nat -A POSTROUTING -o wan -p tcp -j FULLCONE --to-ports 1024-65535
   ip6tables -t nat -A POSTROUTING -o wan -p udp -j FULLCONE --to-ports 1024-65535
-  ip6tables -t nat -A POSTROUTING -o wan -j FULLCONE
-  ip6tables -t nat -A PREROUTING  -i wan -j FULLCONE
+  ip6tables -t nat -A POSTROUTING -o wan -j MASQUERADE
+  ip6tables -t nat -A PREROUTING  -i wan -p tcp -j FULLCONE
+  ip6tables -t nat -A PREROUTING  -i wan -p udp -j FULLCONE
   ```
 
-- **fw3 生成的 FULLCONE 规则没有端口范围**：`-j FULLCONE` 不带 `--to-ports`，内核拿不到 `NF_NAT_RANGE_PROTO_SPECIFIED`，3-tuple 唯一性保证不生效，表现与原因见[为什么 SNAT 规则带端口范围](#为什么-snat-规则带端口范围)。fw4 已修正，fw3 尚未修改（按代码判断，未在 fw3 上实测）。
+- **fw3 的 UDP-Lite 规则没有端口范围**：iptables 只在 TCP、UDP、SCTP、DCCP、ICMP 规则上接受 `--to-ports`，所以 UDP-Lite 的 FULLCONE 规则不带范围。没有 987 补丁时，UDP-Lite 的 3-tuple 唯一性不生效（见[SNAT 规则的端口范围](#snat-规则的端口范围)）。有 987 时唯一性没问题，但源端口在 1024 以下的连接会保留原端口，被占用时也只在 1024 以下另选。
 
 ### 通用限制
 
@@ -271,9 +280,9 @@ grep "dport=端口 " /proc/net/nf_conntrack
 | | SONiC（本项目） | xt_FULLCONENAT | nft-fullcone | bcm-fullconenat |
 |---|---|---|---|---|
 | 映射存储 | conntrack 自身内 | 平行哈希表 | 平行哈希表 | conntrack 期望表 |
-| 读路径锁 | RCU（无自旋锁） | 全局自旋锁 | 全局自旋锁 | 全局 expect 锁 |
+| 读路径锁 | RCU（987 下按哈希桶加锁） | 全局自旋锁 | 全局自旋锁 | 全局 expect 锁 |
 | 查找复杂度 | O(1) 哈希 | O(1) 哈希 | O(1) 哈希 | **O(N) 全表扫描** |
-| 协议支持 | 全部 L4 | 仅 UDP | 仅 UDP | 仅 UDP |
+| 协议支持 | TCP、UDP（及内核跟踪的 UDP-Lite/SCTP/DCCP） | 仅 UDP | 仅 UDP | 仅 UDP |
 | 清理机制 | 自动（conntrack 生命周期） | Workqueue GC | Workqueue GC | 期望超时 |
 | Per-rule 控制 | 支持（flag bit） | 不支持 | 不支持 | 不支持 |
 | EIM + EIF | 双钩子（PRE+POST）自动 | 双钩子自动 | 双钩子自动 | 依赖 helper 机制 |
@@ -305,7 +314,7 @@ grep "dport=端口 " /proc/net/nf_conntrack
 ### 各自的优势
 
 **sonic-fullcone 更好的地方**：
-- 内核实现更优雅（RCU、无独立模块、全协议）
+- 内核实现更优雅（映射就存在 conntrack 里、按哈希桶加锁、无独立模块、支持 TCP）
 - 代码血统清晰（SONiC 官方，Broadcom 工程师编写）
 - 功能纯粹，维护简单
 
@@ -320,7 +329,7 @@ grep "dport=端口 " /proc/net/nf_conntrack
 - **要加速全家桶** → turboacc（fullcone 只是它的一个子功能）
 - **两个可以共存吗** → 不建议，fullcone 内核补丁会冲突
 
-对大多数家用路由器用户来说，turboacc 的 Chion fullcone（UDP only）已经够用——游戏、P2P、VoIP 全是 UDP。sonic-fullcone 的全协议支持和 RCU 读路径在高并发场景更有价值，家用感知不明显。
+对大多数家用路由器用户来说，turboacc 的 Chion fullcone（UDP only）已经够用——游戏、P2P、VoIP 全是 UDP。sonic-fullcone 的 TCP 支持和按桶加锁在高并发场景更有价值，家用感知不明显。
 
 不过在当前 **fw4 (nftables)** 环境下，turboacc 的其他组件并非不可替代：
 
@@ -334,14 +343,16 @@ grep "dport=端口 " /proc/net/nf_conntrack
 
 ```
 kernel/
-  984-add-sonic-fullcone-support.patch      # nf_nat_core.c：3-tuple 哈希表、EIM/EIF
+  984-add-sonic-fullcone-support.patch      # nf_nat_core.c：SONiC 原版 + 已提交上游的修复（3-tuple 哈希表、EIM/EIF）
   985-add-sonic-fullcone-to-ipt.patch       # xt_MASQUERADE.c：iptables FULLCONE target (PRE+POST)
-  986-add-sonic-fullcone-to-nft.patch       # nft_masq.c：nftables fullcone 表达式 (PRE+POST)
+  986-add-sonic-fullcone-to-nft.patch       # nft_masq.c：nftables fullcone 表达式 (PRE+POST，ip/ip6/inet 表)
+  987-sonic-fullcone-fix-*.patch            # nf_nat_core.c：本项目的修复（并发竞争、无端口范围、误丢包）
 
 patches/
   iptables/901-sonic-fullcone.patch         # libxt_NAT.c：注册 FULLCONE 用户态 target
   libnftnl/001-libnftnl-*.patch             # fullcone 表达式序列化
   nftables/002-nftables-*.patch             # nft CLI "fullcone" 关键字
+  nftables/003-nftables-*.patch             # fullcone 的 JSON 输入、nft -o 优化器
   luci-app-firewall/001-add-*.patch         # LuCI Web 界面集成
 
 translations/
@@ -357,6 +368,8 @@ firewall/
 - 内核补丁：Akhilesh Samineni (Broadcom)，来自 [sonic-net/sonic-linux-kernel](https://github.com/sonic-net/sonic-linux-kernel)
 - nftables/libnftnl 表达式接口：Syrone Wong (fullcone-nat-nftables)
 - OpenWrt 集成：openwrt-sonic-fullcone contributors
+- 锁、并发和 fw4 地址限制等问题，最早是对照 [VIKINGYFY/immortalwrt](https://github.com/VIKINGYFY/immortalwrt) 和 [Canary233/openwrt-sonic-fullcone](https://github.com/Canary233/openwrt-sonic-fullcone) 的改动发现的
+- fw3 探测 `FULLCONE` target、按协议生成带端口范围的规则，`fullcone` 表达式支持 ip/ip6 表，以及 `ipt_FULLCONE` 模块别名，参考了 VIKINGYFY 的实现
 
 ## 许可证
 
